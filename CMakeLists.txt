@@ -53,15 +53,11 @@ endif()
 # general
 #option(SD_BUILD_TESTS                "sd: build tests"    ${SD_STANDALONE})
 option(SD_BUILD_EXAMPLES             "sd: build examples" ${SD_STANDALONE})
-<<<<<<< HEAD
 option(SD_CUDA                       "sd: cuda backend" ON)
-=======
 option(SD_WEBP                       "sd: enable WebP image I/O support" ${SD_WEBP_DEFAULT})
 option(SD_USE_SYSTEM_WEBP            "sd: link against system libwebp" OFF)
 option(SD_WEBM                       "sd: enable WebM video output support" ${SD_WEBM_DEFAULT})
 option(SD_USE_SYSTEM_WEBM            "sd: link against system libwebm" OFF)
-option(SD_CUDA                       "sd: cuda backend" OFF)
->>>>>>> 3d6064b37ef4607917f8acf2ca8c8906d5087413
 option(SD_HIPBLAS                    "sd: rocm backend" OFF)
 option(SD_METAL                      "sd: metal backend" OFF)
 option(SD_VULKAN                     "sd: vulkan backend" OFF)
