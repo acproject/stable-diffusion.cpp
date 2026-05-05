@@ -440,6 +440,13 @@ SDVersion ModelLoader::get_sd_version() {
             tensor_storage.name.find("joint_blocks.") != std::string::npos) {
             return VERSION_SD3;
         }
+        if (tensor_storage.name == "model.diffusion_model.audio_scale_shift_table" ||
+            tensor_storage.name.find("model.diffusion_model.audio_patchify_proj.") != std::string::npos ||
+            tensor_storage.name.find("model.diffusion_model.audio_adaln_single.") != std::string::npos ||
+            tensor_storage.name.find("model.diffusion_model.av_ca_video_scale_shift_adaln_single.") != std::string::npos ||
+            tensor_storage.name.find("model.diffusion_model.video_embeddings_connector.") != std::string::npos) {
+            return VERSION_LTXV2;
+        }
         if (tensor_storage.name.find("model.diffusion_model.transformer_blocks.0.img_mod.1.weight") != std::string::npos ||
             tensor_storage.name.find("transformer_blocks.0.img_mod.1.weight") != std::string::npos) {
             return VERSION_QWEN_IMAGE;

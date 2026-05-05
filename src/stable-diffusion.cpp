@@ -1,3 +1,5 @@
+#include <dirent.h>
+
 #include "ggml_extend.hpp"
 
 #include "model.h"
@@ -511,6 +513,85 @@ public:
                                                                     offload_params_to_cpu,
                                                                     tensor_storage_map,
                                                                     "model.diffusion_model");
+            } else if (sd_version_is_ltxv2(version)) {
+                // LTX-2.3 uses Gemma-3-12B as its text encoder. The encoder
+                // weights live OUTSIDE the 22B safetensors — the caller
+                // points `text_encoder_path` at a directory containing
+                // `tokenizer.model` plus Gemma safetensors shards. The
+                // 4096-dim aggregate Linear (`text_embedding_projection.
+                // video_aggregate_embed`) IS in the 22B checkpoint and we
+                // wire it into LTXV2Conditioner.
+                auto ltxv_cond = std::make_shared<LTXV2Conditioner>(4096, 128);
+                diffusion_model  = std::make_shared<LTXV2Model>(backend,
+                                                               offload_params_to_cpu,
+                                                               tensor_storage_map,
+                                                               "model.diffusion_model",
+                                                               version);
+                // Build the projection runner from the LTX 22B safetensors.
+                // Its weights are loaded together with the rest of the
+                // LTX tensors further down (we register them in `tensors`).
+                auto proj = std::make_shared<LTXTextEmbedProjection>(
+                    clip_backend, offload_params_to_cpu, tensor_storage_map,
+                    /*in=*/188160, /*out=*/4096);
+                if (!proj->alloc_params_buffer()) {
+                    LOG_ERROR("text_embedding_projection params buffer alloc failed");
+                    return false;
+                }
+                proj->get_param_tensors(tensors,
+                                         "text_embedding_projection.video_aggregate_embed");
+                // If a Gemma directory was provided, load it (heavy).
+                const char* gemma_dir = SAFE_STR(sd_ctx_params->text_encoder_path);
+                if (gemma_dir && gemma_dir[0] != '\0') {
+                    std::string tok_path = std::string(gemma_dir) + "/tokenizer.model";
+                    auto tok = std::make_shared<Gemma3Tokenizer>();
+                    std::string terr;
+                    if (!tok->load_from_spm(tok_path, &terr)) {
+                        LOG_WARN("failed to load Gemma tokenizer at %s: %s",
+                                 tok_path.c_str(), terr.c_str());
+                    } else {
+                        // Enumerate safetensors shards in the directory.
+                        std::vector<std::string> gemma_files;
+                        if (DIR* d = opendir(gemma_dir)) {
+                            struct dirent* e;
+                            while ((e = readdir(d)) != nullptr) {
+                                std::string name = e->d_name;
+                                if (name.size() > 12 &&
+                                    name.substr(name.size() - 12) == ".safetensors") {
+                                    gemma_files.push_back(std::string(gemma_dir) + "/" + name);
+                                }
+                            }
+                            closedir(d);
+                            std::sort(gemma_files.begin(), gemma_files.end());
+                        }
+                        ModelLoader gemma_loader;
+                        bool loaded_any = false;
+                        for (const auto& f : gemma_files) {
+                            if (gemma_loader.init_from_file(f, /*prefix=*/"language_model.")) {
+                                loaded_any = true;
+                            }
+                        }
+                        if (loaded_any) {
+                            auto gemma = std::make_shared<GEMMA3::Gemma3Runner>(
+                                clip_backend, offload_params_to_cpu,
+                                gemma_loader.get_tensor_storage_map(),
+                                /*prefix=*/"model");
+                            gemma->alloc_params_buffer();
+                            std::map<std::string, ggml_tensor*> gt;
+                            gemma->get_param_tensors(gt, "language_model.model");
+                            if (gemma_loader.load_tensors(gt, /*ignore=*/{}, n_threads)) {
+                                ltxv_cond->attach_gemma(gemma, tok, proj);
+                                LOG_INFO("LTX-2.3 Gemma-3 text encoder loaded");
+                            } else {
+                                LOG_WARN("failed to load Gemma tensors");
+                            }
+                        } else {
+                            LOG_WARN("failed to enumerate Gemma shards at %s", gemma_dir);
+                        }
+                    }
+                } else {
+                    LOG_INFO("LTX-2.3: no text_encoder_path set — running unconditional");
+                }
+                cond_stage_model = ltxv_cond;
             } else {  // SD1.x SD2.x SDXL
                 std::map<std::string, std::string> embbeding_map;
                 for (uint32_t i = 0; i < sd_ctx_params->embedding_count; i++) {
@@ -585,6 +666,14 @@ public:
             };
 
             auto create_vae = [&]() -> std::shared_ptr<VAE> {
+                if (sd_version_is_ltxv2(version)) {
+                    return std::make_shared<LTXV::LTXVVAERunner>(version,
+                                                                 vae_backend,
+                                                                 offload_params_to_cpu,
+                                                                 tensor_storage_map,
+                                                                 "first_stage_model",
+                                                                 vae_decode_only);
+                }
                 if (sd_version_is_wan(version) ||
                     sd_version_is_qwen_image(version) ||
                     sd_version_is_anima(version)) {
@@ -783,6 +872,14 @@ public:
             ignore_tensors.insert("text_encoders.llm.vision_tower.");
             ignore_tensors.insert("text_encoders.llm.multi_modal_projector.");
         }
+        if (sd_version_is_ltxv2(version)) {
+            // LTX-2.3 single-file checkpoints also contain audio VAE and a
+            // vocoder that the video-only pipeline does not consume.
+            // `text_embedding_projection.*` IS consumed when the conditioner
+            // is wired up with a Gemma-3 text encoder (see LTXV2Conditioner).
+            ignore_tensors.insert("audio_vae.");
+            ignore_tensors.insert("vocoder.");
+        }
         bool success = model_loader.load_tensors(tensors, ignore_tensors, n_threads, sd_ctx_params->enable_mmap);
         if (!success) {
             LOG_ERROR("load tensors from model loader failed");
@@ -887,12 +984,17 @@ public:
                            sd_version_is_qwen_image(version) ||
                            sd_version_is_anima(version) ||
                            sd_version_is_ernie_image(version) ||
-                           sd_version_is_z_image(version)) {
+                           sd_version_is_z_image(version) ||
+                           sd_version_is_ltxv2(version)) {
                     pred_type = FLOW_PRED;
                     if (sd_version_is_wan(version)) {
                         default_flow_shift = 5.f;
                     } else if (sd_version_is_ernie_image(version)) {
                         default_flow_shift = 4.f;
+                    } else if (sd_version_is_ltxv2(version)) {
+                        // LTX uses dynamic shift in diffusers (shape-dependent).
+                        // Use a fixed default; tune per hardware-verification run.
+                        default_flow_shift = 3.f;
                     } else {
                         default_flow_shift = 3.f;
                     }
@@ -1813,6 +1915,8 @@ public:
                 latent_channel = 3;
             } else if (sd_version_uses_flux2_vae(version)) {
                 latent_channel = 128;
+            } else if (sd_version_is_ltxv2(version)) {
+                latent_channel = 128;
             } else {
                 latent_channel = 16;
             }
@@ -1835,6 +1939,9 @@ public:
         int T                = frames;
         if (sd_version_is_wan(version)) {
             T = ((T - 1) / 4) + 1;
+        } else if (sd_version_is_ltxv2(version)) {
+            // LTX VAE temporal compression factor = 8
+            T = ((T - 1) / 8) + 1;
         }
         int C = get_latent_channel();
         if (video) {
@@ -2566,7 +2673,14 @@ struct GenerationRequest {
         negative_prompt             = SAFE_STR(sd_vid_gen_params->negative_prompt);
         width                       = sd_vid_gen_params->width;
         height                      = sd_vid_gen_params->height;
-        frames                      = (sd_vid_gen_params->video_frames - 1) / 4 * 4 + 1;
+        // Pad frame count to what each VAE family can decode.
+        // Wan temporal compression = 4 → frames must be 4k+1.
+        // LTX temporal compression = 8 → frames must be 8k+1.
+        {
+            SDVersion ver     = sd_ctx->sd->version;
+            int temporal_grid = sd_version_is_ltxv2(ver) ? 8 : 4;
+            frames            = (sd_vid_gen_params->video_frames - 1) / temporal_grid * temporal_grid + 1;
+        }
         clip_skip                   = sd_vid_gen_params->clip_skip;
         vae_scale_factor            = sd_ctx->sd->get_vae_scale_factor();
         diffusion_model_down_factor = sd_ctx->sd->get_diffusion_model_down_factor();
@@ -2764,6 +2878,18 @@ struct SamplePlan {
                 high_noise_sample_steps = total_steps - sample_steps;
                 LOG_WARN("total_steps != custom_sigmas_count - 1, set high_noise_sample_steps to %d", high_noise_sample_steps);
             }
+        } else if (sd_version_is_ltxv2(sd_ctx->sd->version) && total_steps == 8) {
+            // LTX-2.3 distilled default schedule — a hand-tuned non-linear
+            // sigma sequence clustered near 1 with a sharp drop at the end,
+            // per `DISTILLED_SIGMA_VALUES` in ltx_pipelines.utils.constants.
+            // Applied only when the user asked for exactly 8 sampling
+            // steps (the distilled model's target). Otherwise fall through
+            // to the generic shifted flow schedule.
+            sigmas = {1.0f, 0.99375f, 0.9875f, 0.98125f,
+                      0.975f, 0.909375f, 0.725f, 0.421875f, 0.0f};
+            total_steps  = 8;
+            sample_steps = 8;
+            LOG_INFO("Using LTX-2.3 distilled 8-step sigma schedule");
         } else {
             scheduler_t scheduler = resolve_scheduler(sd_ctx,
                                                       sample_params->scheduler,
