@@ -17,6 +17,8 @@
 
 #include "gemma3_tokenizer.h"
 
+#include "gguf.h"
+
 #include <algorithm>
 #include <cstring>
 #include <fstream>
@@ -173,6 +175,61 @@ bool Gemma3Tokenizer::load_from_spm(const std::string& path, std::string* error)
     bos_id_ = find("<bos>", 2);
     unk_id_ = find("<unk>", 3);
 
+    return true;
+}
+
+bool Gemma3Tokenizer::load_from_gguf(const std::string& path, std::string* error) {
+    struct gguf_context* ctx_gguf = gguf_init_from_file(path.c_str(), {false, nullptr});
+    if (!ctx_gguf) {
+        if (error) *error = "cannot open GGUF file " + path;
+        return false;
+    }
+
+    int64_t tokens_key = gguf_find_key(ctx_gguf, "tokenizer.ggml.tokens");
+    int64_t scores_key = gguf_find_key(ctx_gguf, "tokenizer.ggml.scores");
+    int64_t types_key  = gguf_find_key(ctx_gguf, "tokenizer.ggml.token_type");
+
+    if (tokens_key < 0 || scores_key < 0 || types_key < 0) {
+        if (error) *error = "GGUF file missing tokenizer metadata";
+        gguf_free(ctx_gguf);
+        return false;
+    }
+
+    size_t n_tokens = gguf_get_arr_n(ctx_gguf, tokens_key);
+    if (n_tokens == 0) {
+        if (error) *error = "empty tokenizer in GGUF file";
+        gguf_free(ctx_gguf);
+        return false;
+    }
+
+    const float* scores = (const float*)gguf_get_arr_data(ctx_gguf, scores_key);
+    const int32_t* types = (const int32_t*)gguf_get_arr_data(ctx_gguf, types_key);
+
+    pieces_.clear();
+    piece_to_id_.clear();
+
+    for (size_t i = 0; i < n_tokens; i++) {
+        const char* text = gguf_get_arr_str(ctx_gguf, tokens_key, i);
+        Piece p;
+        p.text  = text ? text : "";
+        p.score = scores[i];
+        p.type  = (types[i] >= 1 && types[i] <= 6) ? (TokenType)types[i] : NORMAL;
+        piece_to_id_[p.text] = (int32_t)pieces_.size();
+        pieces_.push_back(std::move(p));
+    }
+
+    // Read special token IDs from GGUF metadata if available.
+    int64_t bos_key = gguf_find_key(ctx_gguf, "tokenizer.ggml.bos_token_id");
+    int64_t eos_key = gguf_find_key(ctx_gguf, "tokenizer.ggml.eos_token_id");
+    int64_t pad_key = gguf_find_key(ctx_gguf, "tokenizer.ggml.padding_token_id");
+    int64_t unk_key = gguf_find_key(ctx_gguf, "tokenizer.ggml.unknown_token_id");
+
+    bos_id_ = (bos_key >= 0) ? (int32_t)gguf_get_val_u32(ctx_gguf, bos_key) : 2;
+    eos_id_ = (eos_key >= 0) ? (int32_t)gguf_get_val_u32(ctx_gguf, eos_key) : 1;
+    pad_id_ = (pad_key >= 0) ? (int32_t)gguf_get_val_u32(ctx_gguf, pad_key) : 0;
+    unk_id_ = (unk_key >= 0) ? (int32_t)gguf_get_val_u32(ctx_gguf, unk_key) : 3;
+
+    gguf_free(ctx_gguf);
     return true;
 }
 

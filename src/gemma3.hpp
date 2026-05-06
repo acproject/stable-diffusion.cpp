@@ -80,7 +80,7 @@ namespace GEMMA3 {
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
             ggml_tensor* w = params["weight"];
             if (ctx->weight_adapter) {
-                w = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, w, prefix + "weight");
+                w = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, w, prefix + "weight");
             }
             x = ggml_rms_norm(ctx->ggml_ctx, x, eps);
             // Equivalent to `x * (1 + w)` — add a fresh f32 "1" tensor of

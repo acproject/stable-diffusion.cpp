@@ -3,6 +3,7 @@
 #include "ggml_extend.hpp"
 
 #include "model.h"
+#include "model_io/gguf_io.h"
 #include "rng.hpp"
 #include "rng_mt19937.hpp"
 #include "rng_philox.hpp"
@@ -530,8 +531,11 @@ public:
                 // Build the projection runner from the LTX 22B safetensors.
                 // Its weights are loaded together with the rest of the
                 // LTX tensors further down (we register them in `tensors`).
+                // Always place params on CPU: the [4096 x 188160] F32 weight
+                // is ~2.9 GB and is only used once during conditioning, so
+                // keeping it off the GPU avoids OOM on the main backend.
                 auto proj = std::make_shared<LTXTextEmbedProjection>(
-                    clip_backend, offload_params_to_cpu, tensor_storage_map,
+                    clip_backend, true, tensor_storage_map,
                     /*in=*/188160, /*out=*/4096);
                 if (!proj->alloc_params_buffer()) {
                     LOG_ERROR("text_embedding_projection params buffer alloc failed");
@@ -539,54 +543,87 @@ public:
                 }
                 proj->get_param_tensors(tensors,
                                          "text_embedding_projection.video_aggregate_embed");
+                // Keep proj alive via ltxv_cond even without Gemma.
+                ltxv_cond->attach_proj(proj);
                 // If a Gemma directory was provided, load it (heavy).
-                const char* gemma_dir = SAFE_STR(sd_ctx_params->text_encoder_path);
-                if (gemma_dir && gemma_dir[0] != '\0') {
-                    std::string tok_path = std::string(gemma_dir) + "/tokenizer.model";
+                const char* gemma_path = SAFE_STR(sd_ctx_params->text_encoder_path);
+                if (gemma_path && gemma_path[0] != '\0') {
                     auto tok = std::make_shared<Gemma3Tokenizer>();
                     std::string terr;
-                    if (!tok->load_from_spm(tok_path, &terr)) {
-                        LOG_WARN("failed to load Gemma tokenizer at %s: %s",
-                                 tok_path.c_str(), terr.c_str());
-                    } else {
-                        // Enumerate safetensors shards in the directory.
+                    ModelLoader gemma_loader;
+                    bool loaded_any = false;
+
+                    if (is_gguf_file(gemma_path)) {
+                        // text_encoder_path points to a single GGUF file.
+                        if (!tok->load_from_gguf(gemma_path, &terr)) {
+                            LOG_WARN("failed to load Gemma tokenizer from GGUF %s: %s",
+                                     gemma_path, terr.c_str());
+                        } else if (gemma_loader.init_from_file(gemma_path, /*prefix=*/"language_model.")) {
+                            loaded_any = true;
+                        }
+                    } else if (is_directory(gemma_path)) {
+                        // text_encoder_path points to a directory.
+                        // Try loading tokenizer from GGUF files first, then fallback to SPM.
                         std::vector<std::string> gemma_files;
-                        if (DIR* d = opendir(gemma_dir)) {
+                        bool tok_loaded = false;
+                        if (DIR* d = opendir(gemma_path)) {
                             struct dirent* e;
                             while ((e = readdir(d)) != nullptr) {
                                 std::string name = e->d_name;
-                                if (name.size() > 12 &&
-                                    name.substr(name.size() - 12) == ".safetensors") {
-                                    gemma_files.push_back(std::string(gemma_dir) + "/" + name);
+                                if ((name.size() > 12 &&
+                                     name.substr(name.size() - 12) == ".safetensors") ||
+                                    (name.size() > 5 &&
+                                     name.substr(name.size() - 5) == ".gguf")) {
+                                    gemma_files.push_back(std::string(gemma_path) + "/" + name);
                                 }
                             }
                             closedir(d);
                             std::sort(gemma_files.begin(), gemma_files.end());
                         }
-                        ModelLoader gemma_loader;
-                        bool loaded_any = false;
+                        // Try GGUF-based tokenizer first.
                         for (const auto& f : gemma_files) {
-                            if (gemma_loader.init_from_file(f, /*prefix=*/"language_model.")) {
-                                loaded_any = true;
+                            if (f.size() > 5 && f.substr(f.size() - 5) == ".gguf") {
+                                if (tok->load_from_gguf(f, &terr)) {
+                                    tok_loaded = true;
+                                    break;
+                                }
                             }
                         }
-                        if (loaded_any) {
-                            auto gemma = std::make_shared<GEMMA3::Gemma3Runner>(
-                                clip_backend, offload_params_to_cpu,
-                                gemma_loader.get_tensor_storage_map(),
-                                /*prefix=*/"model");
-                            gemma->alloc_params_buffer();
-                            std::map<std::string, ggml_tensor*> gt;
-                            gemma->get_param_tensors(gt, "language_model.model");
-                            if (gemma_loader.load_tensors(gt, /*ignore=*/{}, n_threads)) {
-                                ltxv_cond->attach_gemma(gemma, tok, proj);
-                                LOG_INFO("LTX-2.3 Gemma-3 text encoder loaded");
-                            } else {
-                                LOG_WARN("failed to load Gemma tensors");
-                            }
+                        // Fallback to SentencePiece tokenizer.model.
+                        if (!tok_loaded) {
+                            std::string tok_path = std::string(gemma_path) + "/tokenizer.model";
+                            tok_loaded = tok->load_from_spm(tok_path, &terr);
+                        }
+                        if (!tok_loaded) {
+                            LOG_WARN("failed to load Gemma tokenizer from %s: %s",
+                                     gemma_path, terr.c_str());
                         } else {
-                            LOG_WARN("failed to enumerate Gemma shards at %s", gemma_dir);
+                            for (const auto& f : gemma_files) {
+                                if (gemma_loader.init_from_file(f, /*prefix=*/"language_model.")) {
+                                    loaded_any = true;
+                                }
+                            }
                         }
+                    } else {
+                        LOG_WARN("text_encoder_path is neither a GGUF file nor a directory: %s", gemma_path);
+                    }
+
+                    if (loaded_any) {
+                        auto gemma = std::make_shared<GEMMA3::Gemma3Runner>(
+                            clip_backend, offload_params_to_cpu,
+                            gemma_loader.get_tensor_storage_map(),
+                            /*prefix=*/"model");
+                        gemma->alloc_params_buffer();
+                        std::map<std::string, ggml_tensor*> gt;
+                        gemma->get_param_tensors(gt, "language_model.model");
+                        if (gemma_loader.load_tensors(gt, /*ignore=*/{}, n_threads)) {
+                            ltxv_cond->attach_gemma(gemma, tok, proj);
+                            LOG_INFO("LTX-2.3 Gemma-3 text encoder loaded");
+                        } else {
+                            LOG_WARN("failed to load Gemma tensors");
+                        }
+                    } else {
+                        LOG_WARN("failed to load Gemma model from %s", gemma_path);
                     }
                 } else {
                     LOG_INFO("LTX-2.3: no text_encoder_path set — running unconditional");
@@ -879,6 +916,11 @@ public:
             // is wired up with a Gemma-3 text encoder (see LTXV2Conditioner).
             ignore_tensors.insert("audio_vae.");
             ignore_tensors.insert("vocoder.");
+            ignore_tensors.insert("text_embedding_projection.audio_aggregate_embed.");
+            // fp8 quantization scale factors (not yet supported by ggml
+            // compute — the f8->f16 conversion is done at load time).
+            ignore_tensors.insert(".input_scale");
+            ignore_tensors.insert(".weight_scale");
         }
         bool success = model_loader.load_tensors(tensors, ignore_tensors, n_threads, sd_ctx_params->enable_mmap);
         if (!success) {
@@ -2498,7 +2540,7 @@ struct sd_ctx_t {
 };
 
 static bool sd_version_supports_video_generation(SDVersion version) {
-    return version == VERSION_SVD || sd_version_is_wan(version);
+    return version == VERSION_SVD || sd_version_is_wan(version) || sd_version_is_ltxv2(version);
 }
 
 static bool sd_version_supports_image_generation(SDVersion version) {

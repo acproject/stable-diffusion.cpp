@@ -43,6 +43,10 @@ public:
     // Returns true on success. On failure, `error` holds a message.
     bool load_from_spm(const std::string& path, std::string* error = nullptr);
 
+    // Load vocab + scores from a GGUF file (tokenizer.ggml.tokens/scores/token_type).
+    // Returns true on success. On failure, `error` holds a message.
+    bool load_from_gguf(const std::string& path, std::string* error = nullptr);
+
     // Encode `text` into token ids. If `add_bos` is true, prepends the BOS
     // id; if `add_eos`, appends EOS.
     //

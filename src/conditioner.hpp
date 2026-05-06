@@ -179,6 +179,10 @@ struct LTXV2Conditioner : public Conditioner {
         video_proj      = std::move(proj);
     }
 
+    void attach_proj(std::shared_ptr<LTXTextEmbedProjection> proj) {
+        video_proj = std::move(proj);
+    }
+
     void alloc_params_buffer() override {}
     void free_params_buffer() override {}
     void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {}
