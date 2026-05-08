@@ -552,18 +552,17 @@ public:
                     std::string terr;
                     ModelLoader gemma_loader;
                     bool loaded_any = false;
+                    bool is_gguf    = false;
 
                     if (is_gguf_file(gemma_path)) {
-                        // text_encoder_path points to a single GGUF file.
                         if (!tok->load_from_gguf(gemma_path, &terr)) {
                             LOG_WARN("failed to load Gemma tokenizer from GGUF %s: %s",
                                      gemma_path, terr.c_str());
                         } else if (gemma_loader.init_from_file(gemma_path, /*prefix=*/"language_model.")) {
                             loaded_any = true;
+                            is_gguf    = true;
                         }
                     } else if (is_directory(gemma_path)) {
-                        // text_encoder_path points to a directory.
-                        // Try loading tokenizer from GGUF files first, then fallback to SPM.
                         std::vector<std::string> gemma_files;
                         bool tok_loaded = false;
                         if (DIR* d = opendir(gemma_path)) {
@@ -580,7 +579,6 @@ public:
                             closedir(d);
                             std::sort(gemma_files.begin(), gemma_files.end());
                         }
-                        // Try GGUF-based tokenizer first.
                         for (const auto& f : gemma_files) {
                             if (f.size() > 5 && f.substr(f.size() - 5) == ".gguf") {
                                 if (tok->load_from_gguf(f, &terr)) {
@@ -589,7 +587,6 @@ public:
                                 }
                             }
                         }
-                        // Fallback to SentencePiece tokenizer.model.
                         if (!tok_loaded) {
                             std::string tok_path = std::string(gemma_path) + "/tokenizer.model";
                             tok_loaded = tok->load_from_spm(tok_path, &terr);
@@ -601,6 +598,9 @@ public:
                             for (const auto& f : gemma_files) {
                                 if (gemma_loader.init_from_file(f, /*prefix=*/"language_model.")) {
                                     loaded_any = true;
+                                    if (f.size() > 5 && f.substr(f.size() - 5) == ".gguf") {
+                                        is_gguf = true;
+                                    }
                                 }
                             }
                         }
@@ -608,19 +608,96 @@ public:
                         LOG_WARN("text_encoder_path is neither a GGUF file nor a directory: %s", gemma_path);
                     }
 
+                    if (loaded_any && is_gguf) {
+                        // Convert GGUF tensor names to HuggingFace format.
+                        // GGUF: blk.{i}.attn_q.weight
+                        //   →  HF: language_model.model.layers.{i}.self_attn.q_proj.weight
+                        // (The Gemma3Runner uses prefix "language_model.model" via
+                        //  get_param_tensors, so the converted names must include
+                        //  the ".model" segment.)
+                        auto& tsmap = gemma_loader.get_tensor_storage_map();
+                        String2TensorStorage new_map;
+                        for (auto& [name, ts] : tsmap) {
+                            std::string new_name = name;
+                            // Strip any existing "language_model." prefix so we
+                            // can handle both GGUF (bare names) and safetensors.
+                            std::string bare = name;
+                            if (bare.size() > 15 && bare.substr(0, 15) == "language_model.") {
+                                bare = bare.substr(15);
+                            }
+                            if (bare == "token_embd.weight") {
+                                new_name = "language_model.model.embed_tokens.weight";
+                            } else if (bare == "output_norm.weight") {
+                                new_name = "language_model.model.norm.weight";
+                            } else {
+                                auto dot = bare.find('.', 4);
+                                if (bare.size() > 4 && bare.substr(0, 4) == "blk." && dot != std::string::npos) {
+                                    std::string layer_idx = bare.substr(4, dot - 4);
+                                    std::string rest      = bare.substr(dot + 1);
+                                    std::string hf_rest;
+                                    if (rest == "attn_norm.weight") {
+                                        hf_rest = "input_layernorm.weight";
+                                    } else if (rest == "post_attention_norm.weight") {
+                                        hf_rest = "post_attention_layernorm.weight";
+                                    } else if (rest == "ffn_norm.weight") {
+                                        hf_rest = "pre_feedforward_layernorm.weight";
+                                    } else if (rest == "post_ffw_norm.weight") {
+                                        hf_rest = "post_feedforward_layernorm.weight";
+                                    } else if (rest == "attn_q.weight") {
+                                        hf_rest = "self_attn.q_proj.weight";
+                                    } else if (rest == "attn_k.weight") {
+                                        hf_rest = "self_attn.k_proj.weight";
+                                    } else if (rest == "attn_v.weight") {
+                                        hf_rest = "self_attn.v_proj.weight";
+                                    } else if (rest == "attn_output.weight") {
+                                        hf_rest = "self_attn.o_proj.weight";
+                                    } else if (rest == "attn_q_norm.weight") {
+                                        hf_rest = "self_attn.q_norm.weight";
+                                    } else if (rest == "attn_k_norm.weight") {
+                                        hf_rest = "self_attn.k_norm.weight";
+                                    } else if (rest == "ffn_gate.weight") {
+                                        hf_rest = "mlp.gate_proj.weight";
+                                    } else if (rest == "ffn_up.weight") {
+                                        hf_rest = "mlp.up_proj.weight";
+                                    } else if (rest == "ffn_down.weight") {
+                                        hf_rest = "mlp.down_proj.weight";
+                                    } else {
+                                        hf_rest = rest;
+                                    }
+                                    new_name = "language_model.model.layers." + layer_idx + "." + hf_rest;
+                                }
+                            }
+                            ts.name = new_name;
+                            new_map.insert({new_name, std::move(ts)});
+                        }
+                        tsmap.swap(new_map);
+                    }
+
                     if (loaded_any) {
+                        // Gemma-3-12B is too large for GPU alongside the
+                        // diffusion model. Run it entirely on CPU.
+                        // Pass a CPU backend so both params and compute live
+                        // in system RAM. We must keep the backend alive for
+                        // the lifetime of the Gemma3Runner; the simplest way
+                        // is to store it inside the conditioner via a shared
+                        // pointer alongside the runner.
+                        auto gemma_cpu_backend = ggml_backend_cpu_init();
                         auto gemma = std::make_shared<GEMMA3::Gemma3Runner>(
-                            clip_backend, offload_params_to_cpu,
+                            gemma_cpu_backend, /*offload_params_to_cpu=*/false,
                             gemma_loader.get_tensor_storage_map(),
                             /*prefix=*/"model");
-                        gemma->alloc_params_buffer();
-                        std::map<std::string, ggml_tensor*> gt;
-                        gemma->get_param_tensors(gt, "language_model.model");
-                        if (gemma_loader.load_tensors(gt, /*ignore=*/{}, n_threads)) {
-                            ltxv_cond->attach_gemma(gemma, tok, proj);
-                            LOG_INFO("LTX-2.3 Gemma-3 text encoder loaded");
+                        if (!gemma->alloc_params_buffer()) {
+                            LOG_WARN("failed to allocate Gemma params buffer on CPU");
+                            ggml_backend_free(gemma_cpu_backend);
                         } else {
-                            LOG_WARN("failed to load Gemma tensors");
+                            std::map<std::string, ggml_tensor*> gt;
+                            gemma->get_param_tensors(gt, "language_model.model");
+                            if (gemma_loader.load_tensors(gt, /*ignore=*/{}, n_threads)) {
+                                ltxv_cond->attach_gemma(gemma, tok, proj, gemma_cpu_backend);
+                                LOG_INFO("LTX-2.3 Gemma-3 text encoder loaded");
+                            } else {
+                                LOG_WARN("failed to load Gemma tensors");
+                            }
                         }
                     } else {
                         LOG_WARN("failed to load Gemma model from %s", gemma_path);
@@ -1101,6 +1178,7 @@ public:
         }
 
         ggml_free(ctx);
+
         return true;
     }
 
@@ -1986,8 +2064,18 @@ public:
             T = ((T - 1) / 8) + 1;
         }
         int C = get_latent_channel();
+        LOG_INFO("generate_init_latent: W=%d H=%d T=%d C=%d video=%d vae_sf=%d",
+                 W, H, T, C, video, vae_scale_factor);
         if (video) {
-            return sd::zeros<float>({W, H, T, C, 1});
+            auto result = sd::zeros<float>({W, H, T, C, 1});
+            std::string shape_str;
+            for (size_t i = 0; i < result.shape().size(); ++i) {
+                if (i) shape_str += "x";
+                shape_str += std::to_string(result.shape()[i]);
+            }
+            LOG_INFO("generate_init_latent: result shape=[%s] dim=%d numel=%ld",
+                     shape_str.c_str(), (int)result.dim(), (long)result.numel());
+            return result;
         }
         return sd::zeros<float>({W, H, C, 1});
     }
@@ -4008,6 +4096,8 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
         return nullptr;
     }
     ImageGenerationLatents latents = std::move(*latent_inputs_opt);
+    {
+    }
     ImageGenerationEmbeds embeds   = prepare_video_generation_embeds(sd_ctx,
                                                                      sd_vid_gen_params,
                                                                      request,
@@ -4023,6 +4113,15 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
     int T                = static_cast<int>(latents.init_latent.shape()[2]);
 
     sd::Tensor<float> x_t   = latents.init_latent;
+    {
+        std::string shape_str;
+        for (size_t i = 0; i < x_t.shape().size(); ++i) {
+            if (i) shape_str += "x";
+            shape_str += std::to_string(x_t.shape()[i]);
+        }
+        LOG_INFO("generate_video: x_t shape=[%s] dim=%d numel=%ld",
+                 shape_str.c_str(), (int)x_t.dim(), (long)x_t.numel());
+    }
     sd::Tensor<float> noise = sd::Tensor<float>::randn_like(x_t, sd_ctx->sd->rng);
 
     if (plan.high_noise_sample_steps > 0) {

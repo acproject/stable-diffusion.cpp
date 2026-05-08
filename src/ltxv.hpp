@@ -428,9 +428,19 @@ namespace LTXV {
             auto gate_logits = gate->forward(ctx, hidden_states);
             probe_attn("gate_logits", gate_logits);
 
+            LOG_INFO("[ltxv.attn] hidden_states ne=[%lld,%lld,%lld,%lld] kv_src ne=[%lld,%lld,%lld,%lld]",
+                     (long long)hidden_states->ne[0], (long long)hidden_states->ne[1],
+                     (long long)hidden_states->ne[2], (long long)hidden_states->ne[3],
+                     (long long)kv_src->ne[0], (long long)kv_src->ne[1],
+                     (long long)kv_src->ne[2], (long long)kv_src->ne[3]);
+
             auto q = to_q->forward(ctx, hidden_states);
             auto k = to_k->forward(ctx, kv_src);
             auto v = to_v->forward(ctx, kv_src);
+            LOG_INFO("[ltxv.attn] q ne=[%lld,%lld,%lld,%lld] k ne=[%lld,%lld,%lld,%lld] v ne=[%lld,%lld,%lld,%lld]",
+                     (long long)q->ne[0], (long long)q->ne[1], (long long)q->ne[2], (long long)q->ne[3],
+                     (long long)k->ne[0], (long long)k->ne[1], (long long)k->ne[2], (long long)k->ne[3],
+                     (long long)v->ne[0], (long long)v->ne[1], (long long)v->ne[2], (long long)v->ne[3]);
             probe_attn("q_proj", q);
             probe_attn("k_proj", k);
             probe_attn("v_proj", v);
@@ -632,6 +642,10 @@ namespace LTXV {
             int64_t L        = text_embeddings->ne[1];
             int64_t N        = text_embeddings->ne[2];
             GGML_ASSERT(L <= num_registers);
+            LOG_DEBUG("EmbeddingsConnector: input shape [%d,%d,%d,%d], reg shape [%d,%d,%d,%d], num_registers=%d",
+                      (int)D, (int)L, (int)N, (int)text_embeddings->ne[3],
+                      (int)reg->ne[0], (int)reg->ne[1], (int)reg->ne[2], (int)reg->ne[3],
+                      (int)num_registers);
 
             ggml_tensor* x;
             if (L == num_registers) {
@@ -643,7 +657,7 @@ namespace LTXV {
                                                D, num_registers - L,
                                                reg->nb[1], reg->nb[1] * L);
                 reg_slice      = ggml_cont(ctx->ggml_ctx, reg_slice);
-                // Reshape to [dim, R-L, 1] and broadcast across N if needed.
+                // Reshape to [dim, R-L, N] and broadcast across N if needed.
                 auto reg_3d    = ggml_reshape_3d(ctx->ggml_ctx, reg_slice,
                                                   D, num_registers - L, 1);
                 if (N != 1) {
@@ -651,9 +665,13 @@ namespace LTXV {
                                                       D, num_registers - L, N);
                     reg_3d      = ggml_repeat(ctx->ggml_ctx, reg_3d, target);
                 }
+                // Ensure text_embeddings is 3D for concat compatibility.
+                auto text_3d = ggml_reshape_3d(ctx->ggml_ctx, text_embeddings, D, L, N);
                 // Concatenate text FIRST then registers — matches the
                 // reference output layout [text(L), registers(L..R)].
-                x = ggml_concat(ctx->ggml_ctx, text_embeddings, reg_3d, 1);
+                x = ggml_concat(ctx->ggml_ctx, text_3d, reg_3d, 1);
+                LOG_DEBUG("EmbeddingsConnector: after concat shape [%d,%d,%d,%d]",
+                          (int)x->ne[0], (int)x->ne[1], (int)x->ne[2], (int)x->ne[3]);
             }
 
             for (int64_t i = 0; i < num_blocks; ++i) {
@@ -731,10 +749,11 @@ namespace LTXV {
                              ggml_tensor* hidden,
                              ggml_tensor* encoder,
                              ggml_tensor* temb,
-                             ggml_tensor* rope_cos     = nullptr,
-                             ggml_tensor* rope_sin     = nullptr,
-                             ggml_tensor* encoder_mask = nullptr,
-                             int block_idx            = -1) {
+                             ggml_tensor* rope_cos      = nullptr,
+                             ggml_tensor* rope_sin      = nullptr,
+                             ggml_tensor* encoder_mask  = nullptr,
+                             ggml_tensor* prompt_temb   = nullptr,
+                             int block_idx             = -1) {
             auto attn1 = std::dynamic_pointer_cast<LTXAttention>(blocks["attn1"]);
             auto attn2 = std::dynamic_pointer_cast<LTXAttention>(blocks["attn2"]);
             auto ff    = std::dynamic_pointer_cast<FeedForward>(blocks["ff"]);
@@ -787,6 +806,13 @@ namespace LTXV {
                 return ggml_repeat(ctx->ggml_ctx, scale_msa, target);
             }
 
+            LOG_INFO("[ltxv.block] block=%d hidden ne=[%lld,%lld,%lld,%lld] encoder ne=[%lld,%lld,%lld,%lld]",
+                     block_idx,
+                     (long long)hidden->ne[0], (long long)hidden->ne[1],
+                     (long long)hidden->ne[2], (long long)hidden->ne[3],
+                     (long long)encoder->ne[0], (long long)encoder->ne[1],
+                     (long long)encoder->ne[2], (long long)encoder->ne[3]);
+
             probe_tensor("blk0_hidden_in", hidden);
             probe_tensor("blk0_encoder_in", encoder);
             probe_tensor("blk0_scale_msa", scale_msa);
@@ -826,7 +852,7 @@ namespace LTXV {
                 probe_tensor("blk0_after_attn1_residual", hidden);
             }
 
-            // 2. Prompt cross-attention with Q modulation
+            // 2. Prompt cross-attention with Q modulation + KV modulation
             auto h_norm2 = ggml_rms_norm(ctx->ggml_ctx, hidden, 1e-6f);
             probe_tensor("blk0_after_norm2", h_norm2);
             if (!skip_mod) {
@@ -834,9 +860,30 @@ namespace LTXV {
                 h_norm2 = ggml_add(ctx->ggml_ctx, h_norm2, shift_text_q);
             }
             probe_tensor("blk0_after_mod2", h_norm2);
+
+            ggml_tensor* kv_encoder = encoder;
+            if (!skip_mod && prompt_temb != nullptr) {
+                ggml_tensor* psst = params["prompt_scale_shift_table"];  // [dim, 2]
+                // prompt_temb shape: [dim*2, 1, N, 1] -> reshape to [dim, 2, N, 1]
+                auto pt_r    = ggml_reshape_4d(ctx->ggml_ctx, prompt_temb, dim, 2, prompt_temb->ne[2], prompt_temb->ne[3]);
+                auto kv_ada  = ggml_add(ctx->ggml_ctx, pt_r, psst);
+                auto shift_kv = ggml_reshape_3d(ctx->ggml_ctx,
+                    ggml_view_4d(ctx->ggml_ctx, kv_ada, kv_ada->ne[0], 1, kv_ada->ne[2], kv_ada->ne[3],
+                                 kv_ada->nb[1], kv_ada->nb[2], kv_ada->nb[3], 0),
+                    kv_ada->ne[0], kv_ada->ne[2], kv_ada->ne[3]);
+                auto scale_kv = ggml_reshape_3d(ctx->ggml_ctx,
+                    ggml_view_4d(ctx->ggml_ctx, kv_ada, kv_ada->ne[0], 1, kv_ada->ne[2], kv_ada->ne[3],
+                                 kv_ada->nb[1], kv_ada->nb[2], kv_ada->nb[3], kv_ada->nb[1]),
+                    kv_ada->ne[0], kv_ada->ne[2], kv_ada->ne[3]);
+                // encoder * (1 + scale_kv) + shift_kv = encoder + encoder*scale_kv + shift_kv
+                kv_encoder = ggml_add(ctx->ggml_ctx,
+                    ggml_add(ctx->ggml_ctx, encoder, ggml_mul(ctx->ggml_ctx, encoder, scale_kv)),
+                    shift_kv);
+            }
+
             if (!skip_attn2) {
                 const char* attn2_prefix = (block_idx == 0) ? "blk0_attn2" : nullptr;
-                auto ca_out = attn2->forward(ctx, h_norm2, encoder,
+                auto ca_out = attn2->forward(ctx, h_norm2, kv_encoder,
                                               nullptr, nullptr, nullptr, nullptr, encoder_mask,
                                               attn2_prefix);
                 probe_tensor("blk0_after_attn2", ca_out);
@@ -1110,7 +1157,13 @@ namespace LTXV {
             ggml_set_name(dup_hs, "dbg_patchify_in");
             probes.add("dbg_patchify_in", dup_hs);
 
+            LOG_INFO("[ltxv.dit] hidden_states ne=[%lld,%lld,%lld,%lld] before patchify",
+                     (long long)hidden_states->ne[0], (long long)hidden_states->ne[1],
+                     (long long)hidden_states->ne[2], (long long)hidden_states->ne[3]);
             auto x = patchify->forward(ctx, hidden_states);
+            LOG_INFO("[ltxv.dit] x ne=[%lld,%lld,%lld,%lld] after patchify",
+                     (long long)x->ne[0], (long long)x->ne[1],
+                     (long long)x->ne[2], (long long)x->ne[3]);
 
             auto dup_x = ggml_dup(ctx->ggml_ctx, x);
             ggml_set_name(dup_x, "dbg_after_patchify");
@@ -1123,6 +1176,16 @@ namespace LTXV {
             auto te_pair           = adaln->forward(ctx, timestep);
             auto temb              = te_pair.first;
             auto embedded_timestep = te_pair.second;
+
+            auto prompt_adaln = std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["prompt_adaln_single"]);
+            ggml_tensor* prompt_temb = nullptr;
+            if (prompt_adaln) {
+                auto pt_pair   = prompt_adaln->forward(ctx, timestep);
+                prompt_temb    = pt_pair.first;
+                // prompt_temb shape: [dim*2, N] -> reshape to [dim*2, 1, N, 1] to match temb layout
+                // In block forward, it will be further reshaped to [dim, 2, N, 1]
+                prompt_temb    = ggml_reshape_4d(ctx->ggml_ctx, prompt_temb, prompt_temb->ne[0], 1, prompt_temb->ne[1], 1);
+            }
             if (probe && std::strcmp(probe, "temb") == 0) {
                 ggml_set_name(temb, "ltxv_probe_out");
                 // temb shape doesn't match transformer output expected shape;
@@ -1148,7 +1211,7 @@ namespace LTXV {
             for (int64_t i = 0; i < max_i; ++i) {
                 auto blk = std::dynamic_pointer_cast<LTX2VideoTransformerBlock>(
                     blocks["transformer_blocks." + std::to_string(i)]);
-                x = blk->forward(ctx, x, encoder, temb, rope_cos, rope_sin, encoder_mask, (int)i);
+                x = blk->forward(ctx, x, encoder, temb, rope_cos, rope_sin, encoder_mask, prompt_temb, (int)i);
                 // Probe the first few block outputs.
                 if (i < 3) {
                     auto dup = ggml_dup(ctx->ggml_ctx, x);
