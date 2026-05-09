@@ -1072,6 +1072,17 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
                                                ggml_tensor* b,
                                                bool force_prec_f32 = false,
                                                float scale         = 1.f) {
+    static bool verbose_linear = std::getenv("LTXV_VERBOSE_LINEAR") != nullptr;
+    if (verbose_linear) {
+        LOG_INFO("[ggml_ext_linear] w ne=[%lld,%lld,%lld,%lld] x ne=[%lld,%lld,%lld,%lld]",
+                 (long long)w->ne[0], (long long)w->ne[1], (long long)w->ne[2], (long long)w->ne[3],
+                 (long long)x->ne[0], (long long)x->ne[1], (long long)x->ne[2], (long long)x->ne[3]);
+    }
+    if (w->ne[0] != x->ne[0]) {
+        LOG_WARN("[ggml_ext_linear] DIM MISMATCH: w ne=[%lld,%lld,%lld,%lld] x ne=[%lld,%lld,%lld,%lld]",
+                 (long long)w->ne[0], (long long)w->ne[1], (long long)w->ne[2], (long long)w->ne[3],
+                 (long long)x->ne[0], (long long)x->ne[1], (long long)x->ne[2], (long long)x->ne[3]);
+    }
     if (scale != 1.f) {
         x = ggml_ext_scale(ctx, x, scale);
     }
@@ -1401,6 +1412,10 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
 
         if (mask_in != nullptr) {
+            if (kv_pad > 0) {
+                auto pad_tensor = ggml_ext_full(ctx, -INFINITY, kv_pad, mask_in->ne[1], 1, 1);
+                mask_in         = ggml_concat(ctx, mask_in, pad_tensor, 0);
+            }
             mask_in = ggml_transpose(ctx, mask_in);
         } else {
             if (kv_pad > 0) {
@@ -2703,6 +2718,13 @@ public:
         ggml_tensor* w = params["weight"];
         if (ctx->weight_adapter) {
             w = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, w, prefix + "weight");
+        }
+        static bool verbose_rms = std::getenv("LTXV_VERBOSE_RMSNORM") != nullptr;
+        if (verbose_rms) {
+            LOG_INFO("[RMSNorm] prefix='%s' x ne=[%lld,%lld,%lld,%lld] w ne=[%lld] hidden_size=%lld eps=%g",
+                     prefix.c_str(),
+                     (long long)x->ne[0], (long long)x->ne[1], (long long)x->ne[2], (long long)x->ne[3],
+                     (long long)w->ne[0], (long long)hidden_size, eps);
         }
         x = ggml_rms_norm(ctx->ggml_ctx, x, eps);
         x = ggml_mul_inplace(ctx->ggml_ctx, x, w);

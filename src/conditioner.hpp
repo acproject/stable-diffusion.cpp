@@ -4,9 +4,11 @@
 #include <optional>
 
 #include "clip.hpp"
+#include "gemma3.hpp"
 #include "llm.hpp"
 #include "t5.hpp"
 #include "tensor_ggml.hpp"
+#include "tokenizers/gemma3_tokenizer.h"
 
 struct SDCondition {
     sd::Tensor<float> c_crossattn;
@@ -93,6 +95,195 @@ public:
     }
     virtual std::string remove_trigger_from_prompt(const std::string& prompt) {
         GGML_ABORT("Not implemented yet!");
+    }
+};
+
+// Small block that owns the LTX-2.3 `text_embedding_projection` linear
+// (`video_aggregate_embed`, loaded from the LTX 22B safetensors) and
+// applies it to a 188160-dim feature produced by Gemma3Runner.
+struct LTXTextEmbedProjection : public GGMLRunner {
+    int64_t in_features;
+    int64_t out_features;
+    std::shared_ptr<Linear> video_proj;
+
+    LTXTextEmbedProjection(ggml_backend_t backend,
+                           bool offload_params_to_cpu,
+                           const String2TensorStorage& tensor_storage_map,
+                           int64_t in_features,
+                           int64_t out_features,
+                           const std::string& prefix = "text_embedding_projection.video_aggregate_embed")
+        : GGMLRunner(backend, offload_params_to_cpu),
+          in_features(in_features),
+          out_features(out_features) {
+        // Force F32: the [4096 x 188160] matmul accumulates over 188k
+        // terms, and BF16 mantissa (~3 decimal digits) drops enough
+        // precision to visibly shrink the output range (std 5.2 vs HF's
+        // 6.8 on identical inputs). F32 brings us back within HF's noise.
+        video_proj = std::make_shared<Linear>(in_features, out_features, /*bias=*/true,
+                                              /*force_f32=*/true,
+                                              /*force_prec_f32=*/true);
+        video_proj->init(params_ctx, tensor_storage_map, prefix);
+    }
+
+    std::string get_desc() override { return "ltx_text_proj"; }
+
+    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string prefix) {
+        video_proj->get_param_tensors(tensors, prefix);
+    }
+
+    // x: [in_features, L, 1]
+    // returns: [out_features, L, 1]
+    sd::Tensor<float> compute(int n_threads, const sd::Tensor<float>& x) {
+        auto get_graph = [&]() -> ggml_cgraph* {
+            auto* gf = ggml_new_graph(compute_ctx);
+            auto xt  = make_input(x);
+            auto rctx = get_context();
+            auto y   = video_proj->forward(&rctx, xt);
+            y = ggml_cont(compute_ctx, y);
+            ggml_build_forward_expand(gf, y);
+            return gf;
+        };
+        auto result = GGMLRunner::compute<float>(get_graph, n_threads, false);
+        if (!result.has_value()) return {};
+        return std::move(*result);
+    }
+};
+
+// LTX-2.3 conditioner.
+//
+// When a Gemma-3-12B runner and tokenizer are provided, this path runs
+// the full HF reference:
+//   prompt -> tokenize (Gemma SPM) -> Gemma-3 forward + 49-layer concat
+//          -> per-token RMSNorm + sqrt(out/D) rescale
+//          -> text_embedding_projection.video_aggregate_embed (Linear 188160->4096)
+//          -> c_crossattn [out=4096, L, 1]
+//
+// When no Gemma runner is provided (e.g. running for shape validation),
+// we emit zero embeddings of the expected shape so the DiT can still run.
+struct LTXV2Conditioner : public Conditioner {
+    int64_t caption_channels;
+    int64_t max_tokens;
+    std::shared_ptr<GEMMA3::Gemma3Runner> gemma_runner;
+    std::shared_ptr<Gemma3Tokenizer> gemma_tokenizer;
+    std::shared_ptr<LTXTextEmbedProjection> video_proj;
+    ggml_backend_t gemma_cpu_backend = nullptr;
+    bool flash_attn_enabled = false;
+
+    LTXV2Conditioner(int64_t caption_channels = 4096, int64_t max_tokens = 128)
+        : caption_channels(caption_channels), max_tokens(max_tokens) {}
+
+    ~LTXV2Conditioner() {
+        gemma_runner.reset();
+        if (gemma_cpu_backend) {
+            ggml_backend_free(gemma_cpu_backend);
+            gemma_cpu_backend = nullptr;
+        }
+    }
+
+    void attach_gemma(std::shared_ptr<GEMMA3::Gemma3Runner> runner,
+                      std::shared_ptr<Gemma3Tokenizer> tokenizer,
+                      std::shared_ptr<LTXTextEmbedProjection> proj,
+                      ggml_backend_t cpu_backend = nullptr) {
+        gemma_runner    = std::move(runner);
+        gemma_tokenizer = std::move(tokenizer);
+        if (cpu_backend) {
+            gemma_cpu_backend = cpu_backend;
+        }
+        video_proj      = std::move(proj);
+    }
+
+    void attach_proj(std::shared_ptr<LTXTextEmbedProjection> proj) {
+        video_proj = std::move(proj);
+    }
+
+    void alloc_params_buffer() override {}
+    void free_params_buffer() override {}
+    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {}
+    size_t get_params_buffer_size() override { return 0; }
+    void set_flash_attention_enabled(bool enabled) override {
+        flash_attn_enabled = enabled;
+        if (gemma_runner)  gemma_runner->set_flash_attention_enabled(enabled);
+        if (video_proj)    video_proj->set_flash_attention_enabled(enabled);
+    }
+
+    SDCondition get_learned_condition(int n_threads,
+                                       const ConditionerParams& conditioner_params) override {
+        SDCondition cond;
+        if (!gemma_runner || !gemma_tokenizer || !video_proj) {
+            cond.c_crossattn = sd::zeros<float>({caption_channels, max_tokens, 1});
+            return cond;
+        }
+
+        auto ids = gemma_tokenizer->encode(conditioner_params.text,
+                                            /*add_bos=*/true, /*add_eos=*/false);
+        if ((int64_t)ids.size() > max_tokens) {
+            ids.resize(max_tokens);
+        }
+        sd::Tensor<int32_t> input_ids(std::vector<int64_t>{(int64_t)ids.size(), 1});
+        std::memcpy(input_ids.data(), ids.data(), ids.size() * sizeof(int32_t));
+
+        auto concat = gemma_runner->compute_concatenated_hiddens(n_threads, input_ids,
+                                                                  /*target_out_dim=*/caption_channels);
+        if (concat.empty()) {
+            LOG_WARN("Gemma forward failed — falling back to zero embeddings");
+            cond.c_crossattn = sd::zeros<float>({caption_channels, max_tokens, 1});
+            return cond;
+        }
+        {
+            double mn = 1e30, mx = -1e30, sum = 0, sq = 0;
+            int nan_cnt = 0;
+            for (int64_t i = 0; i < concat.numel(); ++i) {
+                double v = concat.data()[i];
+                if (std::isnan(v)) { nan_cnt++; continue; }
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+                sum += v; sq += v * v;
+            }
+            double mean = sum / std::max(1UL, (unsigned long)(concat.numel() - nan_cnt));
+            double std_  = std::sqrt(std::max(0.0, sq / std::max(1UL, (unsigned long)(concat.numel() - nan_cnt)) - mean * mean));
+            LOG_INFO("[ltxv.cond] gemma_concat: shape=[%zu,%zu] min=%.3f max=%.3f mean=%.3f std=%.3f",
+                     (size_t)concat.shape()[0], (size_t)concat.shape()[1], mn, mx, mean, std_);
+            if (getenv("LTXV_DUMP_COND")) {
+                FILE* f = fopen("/tmp/ltxv_cond_concat.bin", "wb");
+                if (f) {
+                    fwrite(concat.data(), sizeof(float), concat.numel(), f);
+                    fclose(f);
+                    LOG_INFO("[ltxv.cond] dumped concat to /tmp/ltxv_cond_concat.bin (%zu floats)",
+                             (size_t)concat.numel());
+                }
+            }
+        }
+        auto projected = video_proj->compute(n_threads, concat);
+        if (projected.empty()) {
+            LOG_WARN("text_embedding_projection failed — falling back to zero embeddings");
+            cond.c_crossattn = sd::zeros<float>({caption_channels, max_tokens, 1});
+            return cond;
+        }
+        {
+            double mn = 1e30, mx = -1e30, sum = 0, sq = 0;
+            int nan_cnt = 0;
+            for (int64_t i = 0; i < projected.numel(); ++i) {
+                double v = projected.data()[i];
+                if (std::isnan(v)) { nan_cnt++; continue; }
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+                sum += v; sq += v * v;
+            }
+            double mean = sum / std::max(1UL, (unsigned long)(projected.numel() - nan_cnt));
+            double std_  = std::sqrt(std::max(0.0, sq / std::max(1UL, (unsigned long)(projected.numel() - nan_cnt)) - mean * mean));
+            LOG_INFO("[ltxv.cond] projected: shape=[%zu,%zu] min=%.3f max=%.3f mean=%.3f std=%.3f",
+                     (size_t)projected.shape()[0], (size_t)projected.shape()[1], mn, mx, mean, std_);
+            if (getenv("LTXV_DUMP_COND")) {
+                FILE* f = fopen("/tmp/ltxv_cond_projected.bin", "wb");
+                if (f) {
+                    fwrite(projected.data(), sizeof(float), projected.numel(), f);
+                    fclose(f);
+                    LOG_INFO("[ltxv.cond] dumped projected to /tmp/ltxv_cond_projected.bin");
+                }
+            }
+        }
+        cond.c_crossattn = std::move(projected);
+        return cond;
     }
 };
 

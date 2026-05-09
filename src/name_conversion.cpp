@@ -1091,6 +1091,16 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
         prefix_map["te1."] = "text_encoders.clip_l.transformer.";
     }
 
+    if (sd_version_is_sd3(version)) {
+        prefix_map["joint_blocks."]    = "model.diffusion_model.joint_blocks.";
+        prefix_map["pos_embed"]        = "model.diffusion_model.pos_embed";
+        prefix_map["t_embedder."]      = "model.diffusion_model.t_embedder.";
+        prefix_map["x_embedder."]      = "model.diffusion_model.x_embedder.";
+        prefix_map["y_embedder."]      = "model.diffusion_model.y_embedder.";
+        prefix_map["final_layer."]     = "model.diffusion_model.final_layer.";
+        prefix_map["context_embedder."] = "model.diffusion_model.context_embedder.";
+    }
+
     replace_with_prefix_map(name, prefix_map);
 
     // diffusion model
